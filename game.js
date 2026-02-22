@@ -293,10 +293,10 @@ function endGame() {
 }
 
 function updatePlayer(p, opponent, upKey, downKey, leftKey, rightKey, grabKey) {
-  if (p.bumped > 0) { p.bumped--; return; }
-  if (p.moveCD > 0) p.moveCD--;
   if (p.grabCD > 0) p.grabCD--;
   if (p.depositAnim > 0) p.depositAnim--;
+  if (p.bumped > 0) { p.bumped--; return; }
+  if (p.moveCD > 0) p.moveCD--;
 
   const moveRate = 6; // frames between moves (lower = faster)
 
@@ -327,7 +327,7 @@ function updatePlayer(p, opponent, upKey, downKey, leftKey, rightKey, grabKey) {
   p.y += (ty - p.y) * 0.4;
 
   // grab / drop / steal
-  if (consumeKey(grabKey) && p.grabCD <= 0) {
+  if (p.grabCD <= 0 && consumeKey(grabKey)) {
     p.grabCD = 10;
 
     if (!p.carrying) {
