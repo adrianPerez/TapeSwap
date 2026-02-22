@@ -772,19 +772,49 @@ function drawClaw(x, y, angle, openAmount, mainCol, darkCol, lightCol, carrying)
   }
   ctx.restore();
 
-  // carried tape between the jaws
+  // carried tape between the jaws (big, visible)
   if (carrying) {
     const ct = carrying;
-    ctx.fillStyle = ct.golden ? COL.highlight : '#555';
-    ctx.fillRect(8, -6, 14, 12);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(10, -3, 4, 6);
-    ctx.fillRect(16, -3, 4, 6);
-    // label
-    ctx.fillStyle = '#fff';
-    ctx.font = '4px "Press Start 2P", monospace';
+    const tw = 28, th = 22; // tape size
+    const tox = 6, toy = -th / 2; // offset from claw center
+
+    // golden glow behind tape
+    if (ct.golden) {
+      const pulseA = 0.25 + Math.sin(frame * 0.12) * 0.15;
+      ctx.fillStyle = `rgba(255, 204, 0, ${pulseA})`;
+      ctx.fillRect(tox - 3, toy - 3, tw + 6, th + 6);
+    }
+
+    // tape body
+    ctx.fillStyle = ct.golden ? '#8a7520' : '#444';
+    ctx.fillRect(tox, toy, tw, th);
+
+    // tape edge (top/bottom)
+    ctx.fillStyle = ct.golden ? '#6b5a18' : '#333';
+    ctx.fillRect(tox, toy, tw, 3);
+    ctx.fillRect(tox, toy + th - 3, tw, 3);
+
+    // label strip
+    ctx.fillStyle = ct.golden ? COL.highlight : '#666';
+    ctx.fillRect(tox + 4, toy + 5, tw - 8, th - 10);
+
+    // reel holes
+    ctx.fillStyle = ct.golden ? '#8a7520' : '#444';
+    ctx.fillRect(tox + 7, toy + 7, 5, 5);
+    ctx.fillRect(tox + tw - 12, toy + 7, 5, 5);
+
+    // tape ID
+    ctx.fillStyle = ct.golden ? '#000' : '#ddd';
+    ctx.font = '6px "Press Start 2P", monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(ct.labelChar, 15, 7);
+    ctx.fillText(ct.labelChar + ct.labelNum, tox + tw / 2, toy + th - 4);
+
+    // border
+    if (ct.golden) {
+      ctx.strokeStyle = COL.highlight;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(tox - 1, toy - 1, tw + 2, th + 2);
+    }
   }
 
   ctx.restore();
