@@ -136,7 +136,13 @@ function spawnTargetTape() {
 }
 
 // ---- players -----------------------------------------------------
+const ARM_SEG1 = 280;  // upper arm length
+const ARM_SEG2 = 260;  // forearm length
+
 function makePlayer(id, startCol, startRow) {
+  // arm base is mounted on the wall
+  const baseX = id === 1 ? 0 : W;
+  const baseY = H / 2;
   return {
     id,
     col: startCol,
@@ -149,7 +155,11 @@ function makePlayer(id, startCol, startRow) {
     grabCD: 0,
     bumped: 0,
     depositAnim: 0,
-    facing: id === 1 ? 1 : -1, // 1=right, -1=left
+    facing: id === 1 ? 1 : -1,
+    // arm IK state
+    baseX, baseY,
+    elbowX: baseX, elbowY: baseY - 100,
+    clawOpen: 0,      // 0 = closed, animates to 1 when grabbing
   };
 }
 
@@ -652,85 +662,340 @@ function drawTape(x, y, tape) {
   }
 }
 
+// ---- 2-bone inverse kinematics for robot arm --------------------
+function solveIK(bx, by, tx, ty, l1, l2) {
+  let dx = tx - bx, dy = ty - by;
+  let dist = Math.sqrt(dx * dx + dy * dy);
+  // clamp if out of reach
+  if (dist > l1 + l2 - 2) {
+    dist = l1 + l2 - 2;
+    dx = dx / (Math.sqrt(dx*dx+dy*dy) || 1) * dist;
+    dy = dy / (Math.sqrt(dx*dx+dy*dy) || 1) * dist;
+  }
+  if (dist < Math.abs(l1 - l2) + 2) {
+    dist = Math.abs(l1 - l2) + 2;
+  }
+  const a = Math.atan2(dy, dx);
+  const cos2 = (dist * dist + l1 * l1 - l2 * l2) / (2 * dist * l1);
+  const clamped = Math.max(-1, Math.min(1, cos2));
+  const q1 = a - Math.acos(clamped);
+  const ex = bx + Math.cos(q1) * l1;
+  const ey = by + Math.sin(q1) * l1;
+  return { ex, ey };
+}
+
+// ---- draw a thick pixelated arm segment --------------------------
+function drawArmSegment(x1, y1, x2, y2, width, mainCol, darkCol, stripes) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 1) return;
+  const nx = -dy / len, ny = dx / len; // normal
+
+  const hw = width / 2;
+
+  // draw as a filled polygon (4 corners)
+  ctx.beginPath();
+  ctx.moveTo((x1 + nx * hw) | 0, (y1 + ny * hw) | 0);
+  ctx.lineTo((x2 + nx * hw) | 0, (y2 + ny * hw) | 0);
+  ctx.lineTo((x2 - nx * hw) | 0, (y2 - ny * hw) | 0);
+  ctx.lineTo((x1 - nx * hw) | 0, (y1 - ny * hw) | 0);
+  ctx.closePath();
+  ctx.fillStyle = mainCol;
+  ctx.fill();
+
+  // dark edge on one side for depth
+  ctx.beginPath();
+  ctx.moveTo((x1 - nx * hw) | 0, (y1 - ny * hw) | 0);
+  ctx.lineTo((x2 - nx * hw) | 0, (y2 - ny * hw) | 0);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = darkCol;
+  ctx.stroke();
+
+  // highlight edge on other side
+  ctx.beginPath();
+  ctx.moveTo((x1 + nx * hw) | 0, (y1 + ny * hw) | 0);
+  ctx.lineTo((x2 + nx * hw) | 0, (y2 + ny * hw) | 0);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctx.stroke();
+
+  // warning stripes along the segment
+  if (stripes) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo((x1 + nx * hw) | 0, (y1 + ny * hw) | 0);
+    ctx.lineTo((x2 + nx * hw) | 0, (y2 + ny * hw) | 0);
+    ctx.lineTo((x2 - nx * hw) | 0, (y2 - ny * hw) | 0);
+    ctx.lineTo((x1 - nx * hw) | 0, (y1 - ny * hw) | 0);
+    ctx.closePath();
+    ctx.clip();
+
+    const stripeGap = 18;
+    const dirX = dx / len, dirY = dy / len;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+    for (let t = 0; t < len; t += stripeGap) {
+      const sx = x1 + dirX * t;
+      const sy = y1 + dirY * t;
+      ctx.beginPath();
+      ctx.moveTo((sx + nx * hw * 1.2) | 0, (sy + ny * hw * 1.2) | 0);
+      ctx.lineTo((sx - nx * hw * 1.2) | 0, (sy - ny * hw * 1.2) | 0);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+// ---- draw a joint (rivet/bolt circle) ----------------------------
+function drawJoint(x, y, radius, mainCol, darkCol) {
+  // outer ring
+  ctx.fillStyle = darkCol;
+  ctx.beginPath();
+  ctx.arc(x | 0, y | 0, radius + 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // main joint disc
+  ctx.fillStyle = mainCol;
+  ctx.beginPath();
+  ctx.arc(x | 0, y | 0, radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  // rivet highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath();
+  ctx.arc((x - 1) | 0, (y - 1) | 0, radius * 0.4, 0, Math.PI * 2);
+  ctx.fill();
+
+  // center bolt
+  ctx.fillStyle = darkCol;
+  ctx.fillRect((x - 2) | 0, (y - 2) | 0, 4, 4);
+}
+
+// ---- draw the claw/gripper at end of arm -------------------------
+function drawClaw(x, y, angle, openAmount, mainCol, darkCol, lightCol, carrying) {
+  ctx.save();
+  ctx.translate(x | 0, y | 0);
+  ctx.rotate(angle);
+
+  const clawLen = 16;
+  const clawW = 4;
+  const spread = 6 + openAmount * 10; // how wide the claw opens
+
+  // wrist housing
+  ctx.fillStyle = darkCol;
+  ctx.fillRect(-8, -7, 16, 14);
+  ctx.fillStyle = mainCol;
+  ctx.fillRect(-6, -5, 12, 10);
+
+  // status LED on wrist
+  const ledBlink = Math.sin(frame * 0.2) > 0;
+  ctx.fillStyle = carrying ? (ledBlink ? '#0f0' : '#060') : (ledBlink ? lightCol : darkCol);
+  ctx.fillRect(- 3, -4, 3, 3);
+
+  // upper jaw
+  ctx.fillStyle = mainCol;
+  ctx.save();
+  ctx.translate(6, -spread / 2);
+  ctx.fillRect(0, -clawW / 2, clawLen, clawW);
+  // claw tip
+  ctx.fillStyle = lightCol;
+  ctx.fillRect(clawLen - 4, -clawW / 2 - 1, 4, clawW + 2);
+  // serrated inner edge
+  ctx.fillStyle = darkCol;
+  for (let i = 0; i < clawLen - 4; i += 4) {
+    ctx.fillRect(i, clawW / 2 - 2, 2, 2);
+  }
+  ctx.restore();
+
+  // lower jaw
+  ctx.fillStyle = mainCol;
+  ctx.save();
+  ctx.translate(6, spread / 2);
+  ctx.fillRect(0, -clawW / 2, clawLen, clawW);
+  ctx.fillStyle = lightCol;
+  ctx.fillRect(clawLen - 4, -clawW / 2 - 1, 4, clawW + 2);
+  ctx.fillStyle = darkCol;
+  for (let i = 0; i < clawLen - 4; i += 4) {
+    ctx.fillRect(i, -clawW / 2, 2, 2);
+  }
+  ctx.restore();
+
+  // carried tape between the jaws
+  if (carrying) {
+    const ct = carrying;
+    const tapeCol = ct.owner === 1 ? COL.p1 : ct.owner === 2 ? COL.p2 : '#555';
+    ctx.fillStyle = tapeCol;
+    ctx.fillRect(8, -6, 14, 12);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(10, -3, 4, 6);
+    ctx.fillRect(16, -3, 4, 6);
+    // label
+    ctx.fillStyle = '#fff';
+    ctx.font = '4px "Press Start 2P", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(ct.labelChar, 15, 7);
+  }
+
+  ctx.restore();
+}
+
+// ---- wall mount base drawing ------------------------------------
+function drawWallMount(x, y, mainCol, darkCol, lightCol, playerLabel) {
+  const isLeft = x < W / 2;
+  const dir = isLeft ? 1 : -1;
+
+  // mounting plate
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(
+    isLeft ? x - 4 : x - 30,
+    y - 36, 34, 72
+  );
+
+  // bolts on plate
+  ctx.fillStyle = '#333';
+  const bx = isLeft ? x + 4 : x - 10;
+  ctx.fillRect(bx, y - 28, 4, 4);
+  ctx.fillRect(bx, y - 16, 4, 4);
+  ctx.fillRect(bx, y + 12, 4, 4);
+  ctx.fillRect(bx, y + 24, 4, 4);
+
+  // shoulder housing
+  ctx.fillStyle = darkCol;
+  ctx.beginPath();
+  ctx.arc(x | 0, y | 0, 18, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = mainCol;
+  ctx.beginPath();
+  ctx.arc(x | 0, y | 0, 14, 0, Math.PI * 2);
+  ctx.fill();
+
+  // inner ring
+  ctx.strokeStyle = darkCol;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x | 0, y | 0, 8, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // center axle
+  ctx.fillStyle = '#333';
+  ctx.fillRect((x - 3) | 0, (y - 3) | 0, 6, 6);
+
+  // player label above mount
+  ctx.fillStyle = lightCol;
+  ctx.font = '8px "Press Start 2P", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(playerLabel, x + dir * 8, y - 42);
+
+  // warning stripe below mount
+  ctx.fillStyle = mainCol;
+  ctx.globalAlpha = 0.3;
+  ctx.fillRect(
+    isLeft ? x - 4 : x - 30,
+    y + 36, 34, 4
+  );
+  ctx.globalAlpha = 1;
+}
+
 function drawPlayer(p) {
-  const px = p.x | 0, py = p.y | 0;
   const isP1 = p.id === 1;
   const mainCol = isP1 ? COL.p1 : COL.p2;
   const lightCol = isP1 ? COL.p1Light : COL.p2Light;
   const darkCol = isP1 ? COL.p1Dark : COL.p2Dark;
 
-  // bump flash
-  if (p.bumped > 0 && p.bumped % 4 < 2) return;
+  // target position (center of grid cell)
+  const tx = p.x + TILE / 2;
+  const ty = p.y + TILE / 2;
 
-  // shadow
-  ctx.fillStyle = COL.shadow;
-  ctx.fillRect(px + 4, py + TILE - 4, TILE - 8, 6);
+  // solve IK for arm
+  const ik = solveIK(p.baseX, p.baseY, tx, ty, ARM_SEG1, ARM_SEG2);
 
-  // robot body
-  ctx.fillStyle = darkCol;
-  ctx.fillRect(px + 6, py + 6, TILE - 12, TILE - 10);
+  // smooth the elbow position
+  p.elbowX += (ik.ex - p.elbowX) * 0.3;
+  p.elbowY += (ik.ey - p.elbowY) * 0.3;
 
-  ctx.fillStyle = mainCol;
-  ctx.fillRect(px + 8, py + 4, TILE - 16, TILE - 10);
+  // claw open/close animation
+  const wantOpen = p.grabCD > 5 ? 1 : 0;
+  p.clawOpen += (wantOpen - p.clawOpen) * 0.3;
 
-  // visor / eyes
-  ctx.fillStyle = '#000';
-  ctx.fillRect(px + 10, py + 8, TILE - 20, 6);
-
-  // eye pixels
-  const eyeFlicker = frame % 30 < 2 ? '#000' : lightCol;
-  ctx.fillStyle = eyeFlicker;
-  if (p.facing > 0) {
-    ctx.fillRect(px + 14, py + 10, 3, 3);
-    ctx.fillRect(px + 19, py + 10, 3, 3);
-  } else {
-    ctx.fillRect(px + 10, py + 10, 3, 3);
-    ctx.fillRect(px + 15, py + 10, 3, 3);
+  // bump flash — make arm flicker
+  if (p.bumped > 0 && p.bumped % 4 < 2) {
+    // draw faded/ghost arm
+    ctx.globalAlpha = 0.3;
   }
 
-  // antenna
-  ctx.fillStyle = mainCol;
-  ctx.fillRect(px + TILE / 2 - 1, py, 2, 6);
-  ctx.fillStyle = lightCol;
-  const antBlink = Math.sin(frame * 0.15 + p.id * 3) > 0.5;
-  if (antBlink) ctx.fillRect(px + TILE / 2 - 2, py - 1, 4, 3);
+  // --- draw the arm ---
 
-  // arms — extend when carrying
-  const armLen = p.carrying ? 6 : 3;
-  ctx.fillStyle = darkCol;
-  // left arm
-  ctx.fillRect(px + 4 - armLen, py + 10, armLen, 4);
-  // right arm
-  ctx.fillRect(px + TILE - 4, py + 10, armLen, 4);
+  // 1. Wall mount
+  drawWallMount(p.baseX, p.baseY, mainCol, darkCol, lightCol, isP1 ? 'P1' : 'P2');
 
-  // player label
-  ctx.fillStyle = lightCol;
-  ctx.font = '6px "Press Start 2P", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(isP1 ? 'P1' : 'P2', px + TILE / 2, py - 4);
+  // 2. Upper arm (base → elbow) — thicker, with stripes
+  drawArmSegment(p.baseX, p.baseY, p.elbowX, p.elbowY, 14, mainCol, darkCol, true);
 
-  // carried tape indicator
-  if (p.carrying) {
-    const ct = p.carrying;
-    const carryColor = ct.owner === 1 ? COL.p1 : ct.owner === 2 ? COL.p2 : '#666';
-    ctx.fillStyle = carryColor;
-    ctx.fillRect(px + TILE / 2 - 6, py - 14, 12, 8);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(px + TILE / 2 - 4, py - 12, 3, 4);
-    ctx.fillRect(px + TILE / 2 + 1, py - 12, 3, 4);
+  // 3. Hydraulic piston alongside upper arm
+  const pistonOffset = 6;
+  const ux = p.elbowX - p.baseX, uy = p.elbowY - p.baseY;
+  const uLen = Math.sqrt(ux*ux + uy*uy) || 1;
+  const unx = -uy / uLen * pistonOffset, uny = ux / uLen * pistonOffset;
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo((p.baseX + unx) | 0, (p.baseY + uny) | 0);
+  ctx.lineTo((p.elbowX + unx) | 0, (p.elbowY + uny) | 0);
+  ctx.stroke();
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo((p.baseX + unx) | 0, (p.baseY + uny) | 0);
+  ctx.lineTo((p.elbowX * 0.6 + p.baseX * 0.4 + unx) | 0, (p.elbowY * 0.6 + p.baseY * 0.4 + uny) | 0);
+  ctx.stroke();
 
-    // tape id
-    ctx.fillStyle = '#fff';
-    ctx.font = '4px "Press Start 2P", monospace';
-    ctx.fillText(ct.labelChar, px + TILE / 2, py - 6);
-  }
+  // 4. Elbow joint
+  drawJoint(p.elbowX, p.elbowY, 8, mainCol, darkCol);
+
+  // 5. Forearm (elbow → claw) — slightly thinner
+  drawArmSegment(p.elbowX, p.elbowY, tx, ty, 10, mainCol, darkCol, false);
+
+  // 6. Cable/wire along forearm
+  ctx.strokeStyle = darkCol;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  const fLen = Math.sqrt((tx - p.elbowX)**2 + (ty - p.elbowY)**2) || 1;
+  const fnx = -(ty - p.elbowY) / fLen * 7;
+  const fny = (tx - p.elbowX) / fLen * 7;
+  ctx.beginPath();
+  ctx.moveTo((p.elbowX + fnx) | 0, (p.elbowY + fny) | 0);
+  // slight sag via quadratic curve
+  const midX = (p.elbowX + tx) / 2 + fnx * 1.5;
+  const midY = (p.elbowY + ty) / 2 + fny * 1.5 + 8;
+  ctx.quadraticCurveTo(midX | 0, midY | 0, (tx + fnx * 0.5) | 0, (ty + fny * 0.5) | 0);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 7. Wrist joint
+  drawJoint(tx, ty, 6, mainCol, darkCol);
+
+  // 8. Claw/gripper
+  const clawAngle = Math.atan2(ty - p.elbowY, tx - p.elbowX);
+  drawClaw(tx, ty, clawAngle, p.clawOpen, mainCol, darkCol, lightCol, p.carrying);
+
+  // reset alpha if bumped
+  if (p.bumped > 0) ctx.globalAlpha = 1;
+
+  // cursor highlight on the grid cell
+  ctx.strokeStyle = mainCol;
+  ctx.lineWidth = 2;
+  ctx.globalAlpha = 0.5 + Math.sin(frame * 0.15) * 0.3;
+  ctx.strokeRect(p.col * TILE, p.row * TILE, TILE, TILE);
+  ctx.globalAlpha = 1;
 
   // deposit animation
   if (p.depositAnim > 0) {
     ctx.globalAlpha = p.depositAnim / 20;
     ctx.fillStyle = COL.highlight;
     ctx.font = '10px "Press Start 2P", monospace';
-    ctx.fillText('+1', px + TILE / 2, py - 16 - (20 - p.depositAnim) * 1.5);
+    ctx.textAlign = 'center';
+    ctx.fillText('+1', tx, ty - 20 - (20 - p.depositAnim) * 1.5);
     ctx.globalAlpha = 1;
   }
 }
@@ -823,9 +1088,9 @@ function drawTitle() {
 
   ctx.fillStyle = '#444';
   ctx.font = '6px "Press Start 2P", monospace';
-  ctx.fillText('GRAB HIGHLIGHTED TAPES', W / 2, H / 2 + 110);
+  ctx.fillText('EXTEND YOUR ARM TO GRAB TAPES', W / 2, H / 2 + 110);
   ctx.fillText('DEPOSIT IN YOUR ZONE TO SCORE', W / 2, H / 2 + 125);
-  ctx.fillText('BUMP OPPONENT TO STEAL THEIR TAPE', W / 2, H / 2 + 140);
+  ctx.fillText('COLLIDE CLAWS TO STEAL TAPES', W / 2, H / 2 + 140);
 
   // decorative tapes
   const yy = H / 2 - 120;
