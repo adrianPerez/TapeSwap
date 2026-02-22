@@ -106,7 +106,7 @@ function makeTape(golden) {
 }
 
 // ---- golden tape management --------------------------------------
-const MAX_GOLDEN = 2;  // exactly 2 golden tapes active at a time
+const MAX_GOLDEN = 1;  // exactly 1 golden tape active at a time
 
 function countGoldenTapes() {
   let count = 0;
