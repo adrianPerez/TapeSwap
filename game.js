@@ -1,0 +1,879 @@
+// ============================================================
+//  T A P E S W A P  –  two-player tape-library battle
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ---- constants --------------------------------------------------
+const W = 960, H = 640;
+canvas.width = W; canvas.height = H;
+
+const TILE = 32;                 // pixel size of one grid cell
+const COLS = 30, ROWS = 20;     // grid dimensions (30×20 = 960×640)
+
+const LIBRARY_LEFT   = 7;       // tape rack columns 7-22
+const LIBRARY_RIGHT  = 22;
+const LIBRARY_TOP    = 3;
+const LIBRARY_BOTTOM = 17;
+
+const DEPOSIT_WIDTH = 5;        // deposit zone width in tiles
+
+const SCORE_TO_WIN = 10;
+const TAPE_SPAWN_INTERVAL = 180; // frames between new target tapes
+const ROUND_TIME = 90;           // seconds per round
+
+// ---- colour palette (gritty lo-fi) -------------------------------
+const COL = {
+  bg:           '#0d0d0d',
+  floor:        '#151515',
+  wall:         '#1c1c1c',
+  rack:         '#222222',
+  rackLine:     '#2e2e2e',
+  tapeNeutral:  '#3a3a3a',
+  tapeLabel:    '#555555',
+  p1:           '#ff4444',
+  p1Light:      '#ff7777',
+  p1Dark:       '#991111',
+  p1Target:     '#ff2222',
+  p2:           '#4488ff',
+  p2Light:      '#77aaff',
+  p2Dark:       '#113399',
+  p2Target:     '#2266ff',
+  highlight:    '#ffcc00',
+  text:         '#aaaaaa',
+  textBright:   '#dddddd',
+  scanline:     'rgba(0,0,0,0.08)',
+  noise:        'rgba(255,255,255,0.02)',
+  depositP1:    'rgba(255,68,68,0.08)',
+  depositP2:    'rgba(68,136,255,0.08)',
+  shadow:       'rgba(0,0,0,0.4)',
+};
+
+// ---- game state -------------------------------------------------
+let state = 'title';  // title | playing | gameover
+let frame = 0;
+let timer = ROUND_TIME;
+let timerAccum = 0;
+let winner = null;
+let screenShake = 0;
+let particles = [];
+
+// ---- dithering / noise cache ------------------------------------
+const noiseCanvas = document.createElement('canvas');
+noiseCanvas.width = W; noiseCanvas.height = H;
+const noiseCtx = noiseCanvas.getContext('2d');
+function generateNoise() {
+  const img = noiseCtx.createImageData(W, H);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = Math.random() * 20 | 0;
+    img.data[i] = v; img.data[i+1] = v; img.data[i+2] = v;
+    img.data[i+3] = 12;
+  }
+  noiseCtx.putImageData(img, 0, 0);
+}
+generateNoise();
+
+// ---- tape library grid ------------------------------------------
+// Each cell in the library can hold a tape object or null
+const library = [];  // 2D array [col][row]
+
+function initLibrary() {
+  library.length = 0;
+  for (let c = 0; c < COLS; c++) {
+    library[c] = [];
+    for (let r = 0; r < ROWS; r++) {
+      library[c][r] = null;
+    }
+  }
+  // fill the rack with tapes
+  for (let c = LIBRARY_LEFT; c <= LIBRARY_RIGHT; c++) {
+    for (let r = LIBRARY_TOP; r <= LIBRARY_BOTTOM; r++) {
+      library[c][r] = makeTape(0); // neutral tape
+    }
+  }
+}
+
+let tapeIdCounter = 0;
+function makeTape(owner) {
+  // owner: 0=neutral, 1=p1target, 2=p2target
+  const hue = 20 + Math.random() * 30 | 0;
+  return {
+    id: tapeIdCounter++,
+    owner,
+    labelChar: String.fromCharCode(65 + (Math.random() * 26 | 0)),
+    labelNum: (Math.random() * 999 | 0).toString().padStart(3, '0'),
+    shade: `hsl(${hue}, 5%, ${15 + Math.random() * 10 | 0}%)`,
+    edgeShade: `hsl(${hue}, 5%, ${10 + Math.random() * 8 | 0}%)`,
+    wobble: 0,
+  };
+}
+
+// ---- target tape spawning ----------------------------------------
+let targetTapes = [];  // list of {col, row, owner}
+
+function spawnTargetTape() {
+  // pick a random occupied neutral tape in the library
+  const candidates = [];
+  for (let c = LIBRARY_LEFT; c <= LIBRARY_RIGHT; c++) {
+    for (let r = LIBRARY_TOP; r <= LIBRARY_BOTTOM; r++) {
+      const t = library[c][r];
+      if (t && t.owner === 0) {
+        candidates.push({c, r});
+      }
+    }
+  }
+  if (candidates.length === 0) return;
+
+  // spawn one for each player
+  for (let owner = 1; owner <= 2; owner++) {
+    if (candidates.length === 0) break;
+    const idx = Math.random() * candidates.length | 0;
+    const {c, r} = candidates.splice(idx, 1)[0];
+    library[c][r].owner = owner;
+    targetTapes.push({col: c, row: r, owner, flash: 30});
+  }
+}
+
+// ---- players -----------------------------------------------------
+function makePlayer(id, startCol, startRow) {
+  return {
+    id,
+    col: startCol,
+    row: startRow,
+    x: startCol * TILE,
+    y: startRow * TILE,
+    carrying: null,   // tape object or null
+    score: 0,
+    moveCD: 0,
+    grabCD: 0,
+    bumped: 0,
+    depositAnim: 0,
+    facing: id === 1 ? 1 : -1, // 1=right, -1=left
+  };
+}
+
+let p1, p2;
+
+function initPlayers() {
+  p1 = makePlayer(1, 3, 10);
+  p2 = makePlayer(2, 26, 10);
+}
+
+// ---- input -------------------------------------------------------
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (state === 'title') {
+    state = 'playing';
+    initGame();
+  }
+  if (state === 'gameover' && e.code === 'Space') {
+    state = 'playing';
+    initGame();
+  }
+  e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function consumeKey(code) {
+  if (keys[code]) { keys[code] = false; return true; }
+  return false;
+}
+
+// ---- game init ---------------------------------------------------
+function initGame() {
+  frame = 0;
+  timer = ROUND_TIME;
+  timerAccum = 0;
+  winner = null;
+  tapeIdCounter = 0;
+  targetTapes = [];
+  particles = [];
+  screenShake = 0;
+  initLibrary();
+  initPlayers();
+  // spawn initial target tapes
+  for (let i = 0; i < 3; i++) spawnTargetTape();
+}
+
+// ---- particles ---------------------------------------------------
+function spawnParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 4,
+      vy: (Math.random() - 0.5) * 4,
+      life: 20 + Math.random() * 20 | 0,
+      maxLife: 40,
+      color,
+      size: 2 + Math.random() * 3 | 0,
+    });
+  }
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vx *= 0.95;
+    p.vy *= 0.95;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x | 0, p.y | 0, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---- update logic ------------------------------------------------
+function update() {
+  frame++;
+
+  if (state !== 'playing') return;
+
+  // timer
+  timerAccum++;
+  if (timerAccum >= 60) {
+    timerAccum = 0;
+    timer--;
+    if (timer <= 0) {
+      endGame();
+      return;
+    }
+  }
+
+  // spawn target tapes periodically
+  if (frame % TAPE_SPAWN_INTERVAL === 0) {
+    spawnTargetTape();
+  }
+
+  // update players
+  updatePlayer(p1, 'KeyW', 'KeyS', 'KeyA', 'KeyD', 'KeyE');
+  updatePlayer(p2, 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Slash');
+
+  // check collision between players (bump/steal)
+  if (p1.col === p2.col && p1.row === p2.row) {
+    // if one is carrying and the other isn't, steal!
+    if (p1.carrying && !p2.carrying) {
+      p2.carrying = p1.carrying;
+      p1.carrying = null;
+      p1.bumped = 15;
+      screenShake = 8;
+      spawnParticles(p1.x + TILE/2, p1.y + TILE/2, COL.p1, 12);
+    } else if (p2.carrying && !p1.carrying) {
+      p1.carrying = p2.carrying;
+      p2.carrying = null;
+      p2.bumped = 15;
+      screenShake = 8;
+      spawnParticles(p2.x + TILE/2, p2.y + TILE/2, COL.p2, 12);
+    } else if (p1.carrying && p2.carrying) {
+      // both carrying — both get bumped, drop tapes
+      const t1 = p1.carrying, t2 = p2.carrying;
+      p1.carrying = null;
+      p2.carrying = null;
+      p1.bumped = 15;
+      p2.bumped = 15;
+      screenShake = 12;
+      // try to place tapes back at current location
+      if (!library[p1.col][p1.row]) library[p1.col][p1.row] = t1;
+      if (!library[p2.col][p2.row]) library[p2.col][p2.row] = t2;
+      spawnParticles(p1.x + TILE/2, p1.y + TILE/2, COL.highlight, 20);
+    }
+  }
+
+  // screen shake decay
+  if (screenShake > 0) screenShake--;
+
+  updateParticles();
+
+  // update target tape flash
+  for (const tt of targetTapes) {
+    if (tt.flash > 0) tt.flash--;
+  }
+
+  // win check
+  if (p1.score >= SCORE_TO_WIN || p2.score >= SCORE_TO_WIN) {
+    endGame();
+  }
+}
+
+function endGame() {
+  state = 'gameover';
+  if (p1.score > p2.score) winner = 1;
+  else if (p2.score > p1.score) winner = 2;
+  else winner = 0; // tie
+}
+
+function updatePlayer(p, upKey, downKey, leftKey, rightKey, grabKey) {
+  if (p.bumped > 0) { p.bumped--; return; }
+  if (p.moveCD > 0) p.moveCD--;
+  if (p.grabCD > 0) p.grabCD--;
+  if (p.depositAnim > 0) p.depositAnim--;
+
+  const moveRate = 6; // frames between moves (lower = faster)
+
+  if (p.moveCD <= 0) {
+    let dc = 0, dr = 0;
+    if (keys[upKey])    dr = -1;
+    if (keys[downKey])  dr = 1;
+    if (keys[leftKey])  dc = -1;
+    if (keys[rightKey]) dc = 1;
+
+    if (dc !== 0 || dr !== 0) {
+      const nc = p.col + dc;
+      const nr = p.row + dr;
+      if (dc !== 0) p.facing = dc;
+
+      // bounds check
+      if (nc >= 0 && nc < COLS && nr >= 1 && nr < ROWS - 1) {
+        // can't walk into tape racks (unless there's no tape or you're in the library area)
+        const inLib = nc >= LIBRARY_LEFT && nc <= LIBRARY_RIGHT && nr >= LIBRARY_TOP && nr <= LIBRARY_BOTTOM;
+        // players walk between the tape rows (every other row) or on the edges
+        // Actually, let's keep it simple: players can move freely, tapes are on the grid
+        p.col = nc;
+        p.row = nr;
+        p.moveCD = moveRate;
+      }
+    }
+  }
+
+  // smooth pixel position
+  const tx = p.col * TILE, ty = p.row * TILE;
+  p.x += (tx - p.x) * 0.4;
+  p.y += (ty - p.y) * 0.4;
+
+  // grab / drop
+  if (consumeKey(grabKey) && p.grabCD <= 0) {
+    p.grabCD = 10;
+
+    if (!p.carrying) {
+      // try to grab tape from library
+      const t = library[p.col]?.[p.row];
+      if (t) {
+        p.carrying = t;
+        library[p.col][p.row] = null;
+        // remove from target list
+        const idx = targetTapes.findIndex(tt => tt.col === p.col && tt.row === p.row);
+        if (idx >= 0) targetTapes.splice(idx, 1);
+        spawnParticles(p.x + TILE/2, p.y + TILE/2, p.id === 1 ? COL.p1Light : COL.p2Light, 6);
+      }
+    } else {
+      // try to deposit
+      const inP1Zone = p.col < DEPOSIT_WIDTH && p.id === 1;
+      const inP2Zone = p.col >= COLS - DEPOSIT_WIDTH && p.id === 2;
+
+      if (inP1Zone || inP2Zone) {
+        // score if it's a matching target tape
+        if (p.carrying.owner === p.id) {
+          p.score++;
+          p.depositAnim = 20;
+          screenShake = 4;
+          spawnParticles(p.x + TILE/2, p.y + TILE/2, COL.highlight, 15);
+        } else if (p.carrying.owner === 0) {
+          // depositing a neutral tape — minor penalty feedback
+          spawnParticles(p.x + TILE/2, p.y + TILE/2, '#444', 4);
+        } else {
+          // depositing opponent's target — deny them, still counts half
+          p.score++;
+          p.depositAnim = 20;
+          spawnParticles(p.x + TILE/2, p.y + TILE/2, COL.highlight, 10);
+        }
+        p.carrying = null;
+      } else {
+        // drop tape back onto grid if the cell is empty
+        if (library[p.col] && !library[p.col][p.row]) {
+          // put tape back, re-add to targets if it was a target
+          const tape = p.carrying;
+          library[p.col][p.row] = tape;
+          if (tape.owner !== 0) {
+            targetTapes.push({col: p.col, row: p.row, owner: tape.owner, flash: 0});
+          }
+          p.carrying = null;
+        }
+      }
+    }
+  }
+}
+
+// ---- rendering ---------------------------------------------------
+function draw() {
+  // screen shake offset
+  let sx = 0, sy = 0;
+  if (screenShake > 0) {
+    sx = (Math.random() - 0.5) * screenShake * 1.5 | 0;
+    sy = (Math.random() - 0.5) * screenShake * 1.5 | 0;
+  }
+
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  // background
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(-10, -10, W + 20, H + 20);
+
+  if (state === 'title') {
+    drawTitle();
+    ctx.restore();
+    drawPostProcess();
+    return;
+  }
+
+  // floor
+  drawFloor();
+
+  // deposit zones
+  drawDepositZones();
+
+  // tape library rack structure
+  drawRackStructure();
+
+  // tapes in the library
+  drawLibraryTapes();
+
+  // players
+  drawPlayer(p1);
+  drawPlayer(p2);
+
+  // particles
+  drawParticles();
+
+  // HUD
+  drawHUD();
+
+  ctx.restore();
+
+  // post-process (scanlines, noise)
+  drawPostProcess();
+
+  if (state === 'gameover') {
+    drawGameOver();
+  }
+}
+
+function drawFloor() {
+  ctx.fillStyle = COL.floor;
+  ctx.fillRect(0, 0, W, H);
+
+  // subtle grid pattern
+  ctx.strokeStyle = '#181818';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += TILE) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, H);
+    ctx.stroke();
+  }
+  for (let y = 0; y < H; y += TILE) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
+  }
+
+  // floor dither pattern
+  ctx.fillStyle = '#121212';
+  for (let x = 0; x < W; x += TILE * 2) {
+    for (let y = 0; y < H; y += TILE * 2) {
+      ctx.fillRect(x, y, TILE, TILE);
+    }
+  }
+}
+
+function drawDepositZones() {
+  // P1 deposit zone (left)
+  ctx.fillStyle = COL.depositP1;
+  ctx.fillRect(0, TILE, DEPOSIT_WIDTH * TILE, H - TILE * 2);
+
+  // dashed border
+  ctx.strokeStyle = COL.p1Dark;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([4, 4]);
+  ctx.strokeRect(2, TILE, DEPOSIT_WIDTH * TILE - 2, H - TILE * 2);
+  ctx.setLineDash([]);
+
+  // P1 label
+  ctx.fillStyle = COL.p1Dark;
+  ctx.font = '8px "Press Start 2P", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('P1 DROP', DEPOSIT_WIDTH * TILE / 2, TILE + 16);
+  ctx.fillText('ZONE', DEPOSIT_WIDTH * TILE / 2, TILE + 28);
+
+  // deposited tape visualization
+  for (let i = 0; i < p1.score; i++) {
+    const tx = 8 + (i % 4) * 24;
+    const ty = TILE + 40 + ((i / 4) | 0) * 20;
+    drawMiniTape(tx, ty, COL.p1Dark, COL.p1);
+  }
+
+  // P2 deposit zone (right)
+  const p2x = (COLS - DEPOSIT_WIDTH) * TILE;
+  ctx.fillStyle = COL.depositP2;
+  ctx.fillRect(p2x, TILE, DEPOSIT_WIDTH * TILE, H - TILE * 2);
+
+  ctx.strokeStyle = COL.p2Dark;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([4, 4]);
+  ctx.strokeRect(p2x, TILE, DEPOSIT_WIDTH * TILE - 2, H - TILE * 2);
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = COL.p2Dark;
+  ctx.fillText('P2 DROP', p2x + DEPOSIT_WIDTH * TILE / 2, TILE + 16);
+  ctx.fillText('ZONE', p2x + DEPOSIT_WIDTH * TILE / 2, TILE + 28);
+
+  for (let i = 0; i < p2.score; i++) {
+    const tx = p2x + 20 + (i % 4) * 24;
+    const ty = TILE + 40 + ((i / 4) | 0) * 20;
+    drawMiniTape(tx, ty, COL.p2Dark, COL.p2);
+  }
+}
+
+function drawMiniTape(x, y, body, label) {
+  ctx.fillStyle = body;
+  ctx.fillRect(x, y, 20, 14);
+  ctx.fillStyle = label;
+  ctx.fillRect(x + 3, y + 3, 14, 8);
+  ctx.fillStyle = body;
+  ctx.fillRect(x + 6, y + 5, 3, 4);
+  ctx.fillRect(x + 11, y + 5, 3, 4);
+}
+
+function drawRackStructure() {
+  const lx = LIBRARY_LEFT * TILE;
+  const ly = LIBRARY_TOP * TILE;
+  const lw = (LIBRARY_RIGHT - LIBRARY_LEFT + 1) * TILE;
+  const lh = (LIBRARY_BOTTOM - LIBRARY_TOP + 1) * TILE;
+
+  // rack background
+  ctx.fillStyle = COL.rack;
+  ctx.fillRect(lx - 4, ly - 4, lw + 8, lh + 8);
+
+  // rack frame
+  ctx.strokeStyle = COL.rackLine;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(lx - 4, ly - 4, lw + 8, lh + 8);
+
+  // horizontal shelf lines
+  ctx.strokeStyle = COL.rackLine;
+  ctx.lineWidth = 1;
+  for (let r = LIBRARY_TOP; r <= LIBRARY_BOTTOM + 1; r++) {
+    ctx.beginPath();
+    ctx.moveTo(lx - 4, r * TILE);
+    ctx.lineTo(lx + lw + 4, r * TILE);
+    ctx.stroke();
+  }
+
+  // vertical dividers
+  for (let c = LIBRARY_LEFT; c <= LIBRARY_RIGHT + 1; c += 4) {
+    ctx.beginPath();
+    ctx.moveTo(c * TILE, ly - 4);
+    ctx.lineTo(c * TILE, ly + lh + 4);
+    ctx.stroke();
+  }
+
+  // rack label
+  ctx.fillStyle = '#333';
+  ctx.font = '6px "Press Start 2P", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('▓▓ AUTOMATED TAPE LIBRARY SYS-7200 ▓▓', lx + lw / 2, ly - 10);
+}
+
+function drawLibraryTapes() {
+  for (let c = LIBRARY_LEFT; c <= LIBRARY_RIGHT; c++) {
+    for (let r = LIBRARY_TOP; r <= LIBRARY_BOTTOM; r++) {
+      const tape = library[c][r];
+      if (!tape) {
+        // empty slot — draw a subtle shadow
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(c * TILE + 4, r * TILE + 2, TILE - 8, TILE - 4);
+        continue;
+      }
+      drawTape(c * TILE, r * TILE, tape);
+    }
+  }
+}
+
+function drawTape(x, y, tape) {
+  const glow = tape.owner !== 0;
+  const isP1 = tape.owner === 1;
+  const isP2 = tape.owner === 2;
+
+  // target tape glow
+  if (glow) {
+    const pulseAlpha = 0.3 + Math.sin(frame * 0.1) * 0.15;
+    ctx.fillStyle = isP1
+      ? `rgba(255, 68, 68, ${pulseAlpha})`
+      : `rgba(68, 136, 255, ${pulseAlpha})`;
+    ctx.fillRect(x - 1, y - 1, TILE + 2, TILE + 2);
+  }
+
+  // tape body
+  ctx.fillStyle = tape.shade;
+  ctx.fillRect(x + 3, y + 2, TILE - 6, TILE - 4);
+
+  // tape edge
+  ctx.fillStyle = tape.edgeShade;
+  ctx.fillRect(x + 3, y + 2, TILE - 6, 3);
+  ctx.fillRect(x + 3, y + TILE - 5, TILE - 6, 3);
+
+  // label strip
+  const labelColor = glow
+    ? (isP1 ? COL.p1Target : COL.p2Target)
+    : COL.tapeLabel;
+  ctx.fillStyle = labelColor;
+  ctx.fillRect(x + 6, y + 7, TILE - 12, TILE - 14);
+
+  // reel holes (two circles on the label)
+  ctx.fillStyle = tape.shade;
+  ctx.fillRect(x + 9, y + 10, 4, 4);
+  ctx.fillRect(x + TILE - 13, y + 10, 4, 4);
+
+  // tiny tape ID text
+  if (glow) {
+    ctx.fillStyle = '#fff';
+    ctx.font = '5px "Press Start 2P", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(tape.labelChar, x + TILE / 2, y + TILE - 6);
+  }
+
+  // target border indicator
+  if (glow) {
+    ctx.strokeStyle = isP1 ? COL.p1 : COL.p2;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x + 2, y + 1, TILE - 4, TILE - 2);
+  }
+}
+
+function drawPlayer(p) {
+  const px = p.x | 0, py = p.y | 0;
+  const isP1 = p.id === 1;
+  const mainCol = isP1 ? COL.p1 : COL.p2;
+  const lightCol = isP1 ? COL.p1Light : COL.p2Light;
+  const darkCol = isP1 ? COL.p1Dark : COL.p2Dark;
+
+  // bump flash
+  if (p.bumped > 0 && p.bumped % 4 < 2) return;
+
+  // shadow
+  ctx.fillStyle = COL.shadow;
+  ctx.fillRect(px + 4, py + TILE - 4, TILE - 8, 6);
+
+  // robot body
+  ctx.fillStyle = darkCol;
+  ctx.fillRect(px + 6, py + 6, TILE - 12, TILE - 10);
+
+  ctx.fillStyle = mainCol;
+  ctx.fillRect(px + 8, py + 4, TILE - 16, TILE - 10);
+
+  // visor / eyes
+  ctx.fillStyle = '#000';
+  ctx.fillRect(px + 10, py + 8, TILE - 20, 6);
+
+  // eye pixels
+  const eyeFlicker = frame % 30 < 2 ? '#000' : lightCol;
+  ctx.fillStyle = eyeFlicker;
+  if (p.facing > 0) {
+    ctx.fillRect(px + 14, py + 10, 3, 3);
+    ctx.fillRect(px + 19, py + 10, 3, 3);
+  } else {
+    ctx.fillRect(px + 10, py + 10, 3, 3);
+    ctx.fillRect(px + 15, py + 10, 3, 3);
+  }
+
+  // antenna
+  ctx.fillStyle = mainCol;
+  ctx.fillRect(px + TILE / 2 - 1, py, 2, 6);
+  ctx.fillStyle = lightCol;
+  const antBlink = Math.sin(frame * 0.15 + p.id * 3) > 0.5;
+  if (antBlink) ctx.fillRect(px + TILE / 2 - 2, py - 1, 4, 3);
+
+  // arms — extend when carrying
+  const armLen = p.carrying ? 6 : 3;
+  ctx.fillStyle = darkCol;
+  // left arm
+  ctx.fillRect(px + 4 - armLen, py + 10, armLen, 4);
+  // right arm
+  ctx.fillRect(px + TILE - 4, py + 10, armLen, 4);
+
+  // player label
+  ctx.fillStyle = lightCol;
+  ctx.font = '6px "Press Start 2P", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(isP1 ? 'P1' : 'P2', px + TILE / 2, py - 4);
+
+  // carried tape indicator
+  if (p.carrying) {
+    const ct = p.carrying;
+    const carryColor = ct.owner === 1 ? COL.p1 : ct.owner === 2 ? COL.p2 : '#666';
+    ctx.fillStyle = carryColor;
+    ctx.fillRect(px + TILE / 2 - 6, py - 14, 12, 8);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(px + TILE / 2 - 4, py - 12, 3, 4);
+    ctx.fillRect(px + TILE / 2 + 1, py - 12, 3, 4);
+
+    // tape id
+    ctx.fillStyle = '#fff';
+    ctx.font = '4px "Press Start 2P", monospace';
+    ctx.fillText(ct.labelChar, px + TILE / 2, py - 6);
+  }
+
+  // deposit animation
+  if (p.depositAnim > 0) {
+    ctx.globalAlpha = p.depositAnim / 20;
+    ctx.fillStyle = COL.highlight;
+    ctx.font = '10px "Press Start 2P", monospace';
+    ctx.fillText('+1', px + TILE / 2, py - 16 - (20 - p.depositAnim) * 1.5);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawHUD() {
+  // top bar background
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, W, TILE);
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(0, TILE - 2, W, 2);
+
+  // P1 score
+  ctx.fillStyle = COL.p1;
+  ctx.font = '10px "Press Start 2P", monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`P1: ${p1.score}`, 10, 22);
+
+  // P2 score
+  ctx.fillStyle = COL.p2;
+  ctx.textAlign = 'right';
+  ctx.fillText(`P2: ${p2.score}`, W - 10, 22);
+
+  // timer
+  const timerWarn = timer <= 15;
+  ctx.fillStyle = timerWarn ? (frame % 30 < 15 ? COL.highlight : COL.p1) : COL.textBright;
+  ctx.textAlign = 'center';
+  ctx.font = '12px "Press Start 2P", monospace';
+  const mins = (timer / 60 | 0).toString();
+  const secs = (timer % 60).toString().padStart(2, '0');
+  ctx.fillText(`${mins}:${secs}`, W / 2, 22);
+
+  // score target
+  ctx.fillStyle = COL.text;
+  ctx.font = '6px "Press Start 2P", monospace';
+  ctx.fillText(`FIRST TO ${SCORE_TO_WIN}`, W / 2, TILE * ROWS - 6);
+
+  // controls help
+  ctx.fillStyle = '#333';
+  ctx.font = '5px "Press Start 2P", monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('WASD + E', 10, H - 6);
+  ctx.textAlign = 'right';
+  ctx.fillText('ARROWS + /', W - 10, H - 6);
+}
+
+function drawPostProcess() {
+  // scanlines
+  ctx.fillStyle = COL.scanline;
+  for (let y = 0; y < H; y += 3) {
+    ctx.fillRect(0, y, W, 1);
+  }
+
+  // noise overlay
+  ctx.drawImage(noiseCanvas, 0, 0);
+  if (frame % 8 === 0) generateNoise();
+
+  // vignette
+  const grad = ctx.createRadialGradient(W/2, H/2, H * 0.3, W/2, H/2, H * 0.85);
+  grad.addColorStop(0, 'rgba(0,0,0,0)');
+  grad.addColorStop(1, 'rgba(0,0,0,0.6)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawTitle() {
+  // big title
+  ctx.fillStyle = COL.textBright;
+  ctx.font = '28px "Press Start 2P", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('TAPESWAP', W / 2, H / 2 - 80);
+
+  // subtitle
+  ctx.fillStyle = COL.text;
+  ctx.font = '8px "Press Start 2P", monospace';
+  ctx.fillText('AUTOMATED TAPE LIBRARY BATTLE', W / 2, H / 2 - 50);
+
+  // flickering prompt
+  if (frame % 60 < 40) {
+    ctx.fillStyle = COL.highlight;
+    ctx.font = '10px "Press Start 2P", monospace';
+    ctx.fillText('PRESS ANY KEY', W / 2, H / 2 + 10);
+  }
+
+  // controls
+  ctx.fillStyle = COL.p1;
+  ctx.font = '8px "Press Start 2P", monospace';
+  ctx.fillText('P1: WASD + E (GRAB)', W / 2, H / 2 + 60);
+  ctx.fillStyle = COL.p2;
+  ctx.fillText('P2: ARROWS + / (GRAB)', W / 2, H / 2 + 80);
+
+  ctx.fillStyle = '#444';
+  ctx.font = '6px "Press Start 2P", monospace';
+  ctx.fillText('GRAB HIGHLIGHTED TAPES', W / 2, H / 2 + 110);
+  ctx.fillText('DEPOSIT IN YOUR ZONE TO SCORE', W / 2, H / 2 + 125);
+  ctx.fillText('BUMP OPPONENT TO STEAL THEIR TAPE', W / 2, H / 2 + 140);
+
+  // decorative tapes
+  const yy = H / 2 - 120;
+  for (let i = 0; i < 14; i++) {
+    const xx = W / 2 - 14 * 14 + i * 28;
+    ctx.fillStyle = `hsl(${i * 20}, 20%, 20%)`;
+    ctx.fillRect(xx, yy, 22, 16);
+    ctx.fillStyle = `hsl(${i * 20}, 30%, 30%)`;
+    ctx.fillRect(xx + 3, yy + 4, 16, 8);
+    ctx.fillStyle = `hsl(${i * 20}, 20%, 15%)`;
+    ctx.fillRect(xx + 6, yy + 6, 4, 4);
+    ctx.fillRect(xx + 12, yy + 6, 4, 4);
+  }
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+
+  if (winner === 0) {
+    ctx.fillStyle = COL.highlight;
+    ctx.font = '24px "Press Start 2P", monospace';
+    ctx.fillText('DRAW', W / 2, H / 2 - 30);
+  } else {
+    const wCol = winner === 1 ? COL.p1 : COL.p2;
+    ctx.fillStyle = wCol;
+    ctx.font = '24px "Press Start 2P", monospace';
+    ctx.fillText(`PLAYER ${winner} WINS`, W / 2, H / 2 - 30);
+  }
+
+  ctx.fillStyle = COL.textBright;
+  ctx.font = '12px "Press Start 2P", monospace';
+  ctx.fillText(`${p1.score}  -  ${p2.score}`, W / 2, H / 2 + 10);
+
+  if (frame % 60 < 40) {
+    ctx.fillStyle = COL.text;
+    ctx.font = '8px "Press Start 2P", monospace';
+    ctx.fillText('PRESS SPACE TO RESTART', W / 2, H / 2 + 50);
+  }
+}
+
+// ---- main loop ---------------------------------------------------
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+loop();
