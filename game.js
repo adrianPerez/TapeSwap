@@ -20,7 +20,6 @@ const LIBRARY_BOTTOM = 17;
 const DEPOSIT_WIDTH = 5;        // deposit zone width in tiles
 
 const SCORE_TO_WIN = 10;
-const TAPE_SPAWN_INTERVAL = 180; // frames between new target tapes
 const ROUND_TIME = 90;           // seconds per round
 
 // ---- colour palette (gritty lo-fi) -------------------------------
@@ -35,11 +34,9 @@ const COL = {
   p1:           '#ff4444',
   p1Light:      '#ff7777',
   p1Dark:       '#991111',
-  p1Target:     '#ff2222',
   p2:           '#4488ff',
   p2Light:      '#77aaff',
   p2Dark:       '#113399',
-  p2Target:     '#2266ff',
   highlight:    '#ffcc00',
   text:         '#aaaaaa',
   textBright:   '#dddddd',
@@ -89,49 +86,59 @@ function initLibrary() {
   // fill the rack with tapes
   for (let c = LIBRARY_LEFT; c <= LIBRARY_RIGHT; c++) {
     for (let r = LIBRARY_TOP; r <= LIBRARY_BOTTOM; r++) {
-      library[c][r] = makeTape(0); // neutral tape
+      library[c][r] = makeTape(false); // neutral tape
     }
   }
 }
 
 let tapeIdCounter = 0;
-function makeTape(owner) {
-  // owner: 0=neutral, 1=p1target, 2=p2target
+function makeTape(golden) {
+  // golden: false=neutral, true=golden target
   const hue = 20 + Math.random() * 30 | 0;
   return {
     id: tapeIdCounter++,
-    owner,
+    golden: !!golden,
     labelChar: String.fromCharCode(65 + (Math.random() * 26 | 0)),
     labelNum: (Math.random() * 999 | 0).toString().padStart(3, '0'),
     shade: `hsl(${hue}, 5%, ${15 + Math.random() * 10 | 0}%)`,
     edgeShade: `hsl(${hue}, 5%, ${10 + Math.random() * 8 | 0}%)`,
-    wobble: 0,
   };
 }
 
-// ---- target tape spawning ----------------------------------------
-let targetTapes = [];  // list of {col, row, owner}
+// ---- golden tape management --------------------------------------
+const MAX_GOLDEN = 2;  // exactly 2 golden tapes active at a time
 
-function spawnTargetTape() {
-  // pick a random occupied neutral tape in the library
+function countGoldenTapes() {
+  let count = 0;
+  // count golden tapes in the library
+  for (let c = LIBRARY_LEFT; c <= LIBRARY_RIGHT; c++) {
+    for (let r = LIBRARY_TOP; r <= LIBRARY_BOTTOM; r++) {
+      if (library[c]?.[r]?.golden) count++;
+    }
+  }
+  // count golden tapes being carried
+  if (p1 && p1.carrying?.golden) count++;
+  if (p2 && p2.carrying?.golden) count++;
+  return count;
+}
+
+function spawnGoldenTapes() {
+  const need = MAX_GOLDEN - countGoldenTapes();
+  if (need <= 0) return;
+
   const candidates = [];
   for (let c = LIBRARY_LEFT; c <= LIBRARY_RIGHT; c++) {
     for (let r = LIBRARY_TOP; r <= LIBRARY_BOTTOM; r++) {
       const t = library[c][r];
-      if (t && t.owner === 0) {
-        candidates.push({c, r});
-      }
+      if (t && !t.golden) candidates.push({c, r});
     }
   }
-  if (candidates.length === 0) return;
 
-  // spawn one for each player
-  for (let owner = 1; owner <= 2; owner++) {
-    if (candidates.length === 0) break;
+  for (let i = 0; i < need && candidates.length > 0; i++) {
     const idx = Math.random() * candidates.length | 0;
     const {c, r} = candidates.splice(idx, 1)[0];
-    library[c][r].owner = owner;
-    targetTapes.push({col: c, row: r, owner, flash: 30});
+    library[c][r].golden = true;
+    spawnParticles(c * TILE + TILE/2, r * TILE + TILE/2, COL.highlight, 10);
   }
 }
 
@@ -198,13 +205,12 @@ function initGame() {
   timerAccum = 0;
   winner = null;
   tapeIdCounter = 0;
-  targetTapes = [];
   particles = [];
   screenShake = 0;
   initLibrary();
   initPlayers();
-  // spawn initial target tapes
-  for (let i = 0; i < 3; i++) spawnTargetTape();
+  // spawn initial golden tapes
+  spawnGoldenTapes();
 }
 
 // ---- particles ---------------------------------------------------
@@ -261,54 +267,17 @@ function update() {
     }
   }
 
-  // spawn target tapes periodically
-  if (frame % TAPE_SPAWN_INTERVAL === 0) {
-    spawnTargetTape();
-  }
+  // keep 2 golden tapes active at all times
+  spawnGoldenTapes();
 
   // update players
-  updatePlayer(p1, 'KeyW', 'KeyS', 'KeyA', 'KeyD', 'KeyE');
-  updatePlayer(p2, 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Slash');
-
-  // check collision between players (bump/steal)
-  if (p1.col === p2.col && p1.row === p2.row) {
-    // if one is carrying and the other isn't, steal!
-    if (p1.carrying && !p2.carrying) {
-      p2.carrying = p1.carrying;
-      p1.carrying = null;
-      p1.bumped = 15;
-      screenShake = 8;
-      spawnParticles(p1.x + TILE/2, p1.y + TILE/2, COL.p1, 12);
-    } else if (p2.carrying && !p1.carrying) {
-      p1.carrying = p2.carrying;
-      p2.carrying = null;
-      p2.bumped = 15;
-      screenShake = 8;
-      spawnParticles(p2.x + TILE/2, p2.y + TILE/2, COL.p2, 12);
-    } else if (p1.carrying && p2.carrying) {
-      // both carrying — both get bumped, drop tapes
-      const t1 = p1.carrying, t2 = p2.carrying;
-      p1.carrying = null;
-      p2.carrying = null;
-      p1.bumped = 15;
-      p2.bumped = 15;
-      screenShake = 12;
-      // try to place tapes back at current location
-      if (!library[p1.col][p1.row]) library[p1.col][p1.row] = t1;
-      if (!library[p2.col][p2.row]) library[p2.col][p2.row] = t2;
-      spawnParticles(p1.x + TILE/2, p1.y + TILE/2, COL.highlight, 20);
-    }
-  }
+  updatePlayer(p1, p2, 'KeyW', 'KeyS', 'KeyA', 'KeyD', 'KeyE');
+  updatePlayer(p2, p1, 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Slash');
 
   // screen shake decay
   if (screenShake > 0) screenShake--;
 
   updateParticles();
-
-  // update target tape flash
-  for (const tt of targetTapes) {
-    if (tt.flash > 0) tt.flash--;
-  }
 
   // win check
   if (p1.score >= SCORE_TO_WIN || p2.score >= SCORE_TO_WIN) {
@@ -323,7 +292,7 @@ function endGame() {
   else winner = 0; // tie
 }
 
-function updatePlayer(p, upKey, downKey, leftKey, rightKey, grabKey) {
+function updatePlayer(p, opponent, upKey, downKey, leftKey, rightKey, grabKey) {
   if (p.bumped > 0) { p.bumped--; return; }
   if (p.moveCD > 0) p.moveCD--;
   if (p.grabCD > 0) p.grabCD--;
@@ -345,10 +314,6 @@ function updatePlayer(p, upKey, downKey, leftKey, rightKey, grabKey) {
 
       // bounds check
       if (nc >= 0 && nc < COLS && nr >= 1 && nr < ROWS - 1) {
-        // can't walk into tape racks (unless there's no tape or you're in the library area)
-        const inLib = nc >= LIBRARY_LEFT && nc <= LIBRARY_RIGHT && nr >= LIBRARY_TOP && nr <= LIBRARY_BOTTOM;
-        // players walk between the tape rows (every other row) or on the edges
-        // Actually, let's keep it simple: players can move freely, tapes are on the grid
         p.col = nc;
         p.row = nr;
         p.moveCD = moveRate;
@@ -361,52 +326,48 @@ function updatePlayer(p, upKey, downKey, leftKey, rightKey, grabKey) {
   p.x += (tx - p.x) * 0.4;
   p.y += (ty - p.y) * 0.4;
 
-  // grab / drop
+  // grab / drop / steal
   if (consumeKey(grabKey) && p.grabCD <= 0) {
     p.grabCD = 10;
 
     if (!p.carrying) {
-      // try to grab tape from library
-      const t = library[p.col]?.[p.row];
-      if (t) {
-        p.carrying = t;
-        library[p.col][p.row] = null;
-        // remove from target list
-        const idx = targetTapes.findIndex(tt => tt.col === p.col && tt.row === p.row);
-        if (idx >= 0) targetTapes.splice(idx, 1);
-        spawnParticles(p.x + TILE/2, p.y + TILE/2, p.id === 1 ? COL.p1Light : COL.p2Light, 6);
+      // priority 1: steal from opponent's claw if on the same cell
+      if (opponent.carrying && opponent.col === p.col && opponent.row === p.row) {
+        p.carrying = opponent.carrying;
+        opponent.carrying = null;
+        opponent.bumped = 15;
+        screenShake = 8;
+        spawnParticles(p.x + TILE/2, p.y + TILE/2, COL.highlight, 14);
+      } else {
+        // priority 2: grab tape from library
+        const t = library[p.col]?.[p.row];
+        if (t) {
+          p.carrying = t;
+          library[p.col][p.row] = null;
+          spawnParticles(p.x + TILE/2, p.y + TILE/2, p.id === 1 ? COL.p1Light : COL.p2Light, 6);
+        }
       }
     } else {
-      // try to deposit
+      // try to deposit in own zone
       const inP1Zone = p.col < DEPOSIT_WIDTH && p.id === 1;
       const inP2Zone = p.col >= COLS - DEPOSIT_WIDTH && p.id === 2;
 
       if (inP1Zone || inP2Zone) {
-        // score if it's a matching target tape
-        if (p.carrying.owner === p.id) {
+        if (p.carrying.golden) {
+          // golden tape = score!
           p.score++;
           p.depositAnim = 20;
           screenShake = 4;
           spawnParticles(p.x + TILE/2, p.y + TILE/2, COL.highlight, 15);
-        } else if (p.carrying.owner === 0) {
-          // depositing a neutral tape — minor penalty feedback
-          spawnParticles(p.x + TILE/2, p.y + TILE/2, '#444', 4);
         } else {
-          // depositing opponent's target — deny them, still counts half
-          p.score++;
-          p.depositAnim = 20;
-          spawnParticles(p.x + TILE/2, p.y + TILE/2, COL.highlight, 10);
+          // neutral tape — no points, just a dud
+          spawnParticles(p.x + TILE/2, p.y + TILE/2, '#444', 4);
         }
         p.carrying = null;
       } else {
         // drop tape back onto grid if the cell is empty
         if (library[p.col] && !library[p.col][p.row]) {
-          // put tape back, re-add to targets if it was a target
-          const tape = p.carrying;
-          library[p.col][p.row] = tape;
-          if (tape.owner !== 0) {
-            targetTapes.push({col: p.col, row: p.row, owner: tape.owner, flash: 0});
-          }
+          library[p.col][p.row] = p.carrying;
           p.carrying = null;
         }
       }
@@ -521,7 +482,7 @@ function drawDepositZones() {
   for (let i = 0; i < p1.score; i++) {
     const tx = 8 + (i % 4) * 24;
     const ty = TILE + 40 + ((i / 4) | 0) * 20;
-    drawMiniTape(tx, ty, COL.p1Dark, COL.p1);
+    drawMiniTape(tx, ty, '#8a7520', COL.highlight);
   }
 
   // P2 deposit zone (right)
@@ -542,7 +503,7 @@ function drawDepositZones() {
   for (let i = 0; i < p2.score; i++) {
     const tx = p2x + 20 + (i % 4) * 24;
     const ty = TILE + 40 + ((i / 4) | 0) * 20;
-    drawMiniTape(tx, ty, COL.p2Dark, COL.p2);
+    drawMiniTape(tx, ty, '#8a7520', COL.highlight);
   }
 }
 
@@ -612,51 +573,42 @@ function drawLibraryTapes() {
 }
 
 function drawTape(x, y, tape) {
-  const glow = tape.owner !== 0;
-  const isP1 = tape.owner === 1;
-  const isP2 = tape.owner === 2;
-
-  // target tape glow
-  if (glow) {
-    const pulseAlpha = 0.3 + Math.sin(frame * 0.1) * 0.15;
-    ctx.fillStyle = isP1
-      ? `rgba(255, 68, 68, ${pulseAlpha})`
-      : `rgba(68, 136, 255, ${pulseAlpha})`;
-    ctx.fillRect(x - 1, y - 1, TILE + 2, TILE + 2);
+  // golden tape glow
+  if (tape.golden) {
+    const pulseAlpha = 0.3 + Math.sin(frame * 0.1) * 0.2;
+    ctx.fillStyle = `rgba(255, 204, 0, ${pulseAlpha})`;
+    ctx.fillRect(x - 2, y - 2, TILE + 4, TILE + 4);
   }
 
   // tape body
-  ctx.fillStyle = tape.shade;
+  ctx.fillStyle = tape.golden ? '#8a7520' : tape.shade;
   ctx.fillRect(x + 3, y + 2, TILE - 6, TILE - 4);
 
   // tape edge
-  ctx.fillStyle = tape.edgeShade;
+  ctx.fillStyle = tape.golden ? '#6b5a18' : tape.edgeShade;
   ctx.fillRect(x + 3, y + 2, TILE - 6, 3);
   ctx.fillRect(x + 3, y + TILE - 5, TILE - 6, 3);
 
   // label strip
-  const labelColor = glow
-    ? (isP1 ? COL.p1Target : COL.p2Target)
-    : COL.tapeLabel;
-  ctx.fillStyle = labelColor;
+  ctx.fillStyle = tape.golden ? COL.highlight : COL.tapeLabel;
   ctx.fillRect(x + 6, y + 7, TILE - 12, TILE - 14);
 
-  // reel holes (two circles on the label)
-  ctx.fillStyle = tape.shade;
+  // reel holes
+  ctx.fillStyle = tape.golden ? '#8a7520' : tape.shade;
   ctx.fillRect(x + 9, y + 10, 4, 4);
   ctx.fillRect(x + TILE - 13, y + 10, 4, 4);
 
   // tiny tape ID text
-  if (glow) {
-    ctx.fillStyle = '#fff';
+  if (tape.golden) {
+    ctx.fillStyle = '#000';
     ctx.font = '5px "Press Start 2P", monospace';
     ctx.textAlign = 'center';
     ctx.fillText(tape.labelChar, x + TILE / 2, y + TILE - 6);
   }
 
-  // target border indicator
-  if (glow) {
-    ctx.strokeStyle = isP1 ? COL.p1 : COL.p2;
+  // golden border
+  if (tape.golden) {
+    ctx.strokeStyle = COL.highlight;
     ctx.lineWidth = 2;
     ctx.strokeRect(x + 2, y + 1, TILE - 4, TILE - 2);
   }
@@ -823,8 +775,7 @@ function drawClaw(x, y, angle, openAmount, mainCol, darkCol, lightCol, carrying)
   // carried tape between the jaws
   if (carrying) {
     const ct = carrying;
-    const tapeCol = ct.owner === 1 ? COL.p1 : ct.owner === 2 ? COL.p2 : '#555';
-    ctx.fillStyle = tapeCol;
+    ctx.fillStyle = ct.golden ? COL.highlight : '#555';
     ctx.fillRect(8, -6, 14, 12);
     ctx.fillStyle = '#000';
     ctx.fillRect(10, -3, 4, 6);
@@ -1088,9 +1039,9 @@ function drawTitle() {
 
   ctx.fillStyle = '#444';
   ctx.font = '6px "Press Start 2P", monospace';
-  ctx.fillText('EXTEND YOUR ARM TO GRAB TAPES', W / 2, H / 2 + 110);
+  ctx.fillText('GRAB THE GOLDEN TAPES', W / 2, H / 2 + 110);
   ctx.fillText('DEPOSIT IN YOUR ZONE TO SCORE', W / 2, H / 2 + 125);
-  ctx.fillText('COLLIDE CLAWS TO STEAL TAPES', W / 2, H / 2 + 140);
+  ctx.fillText('SNATCH TAPES FROM YOUR RIVAL\'S CLAW', W / 2, H / 2 + 140);
 
   // decorative tapes
   const yy = H / 2 - 120;
